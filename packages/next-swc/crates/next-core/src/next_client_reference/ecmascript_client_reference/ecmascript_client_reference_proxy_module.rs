@@ -1,7 +1,6 @@
 use std::{io::Write, iter::once};
 
 use anyhow::{bail, Context, Result};
-use indexmap::IndexSet;
 use indoc::writedoc;
 use turbo_tasks::{Value, ValueToString, Vc};
 use turbo_tasks_fs::File;
@@ -71,55 +70,79 @@ impl EcmascriptClientReferenceProxyModule {
 
         let server_module_path = &*self.server_module_ident.path().to_string().await?;
 
-        writedoc!(
-            code,
-            r#"
-                import {{ createProxy }} from 'next/dist/build/webpack/loaders/next-flight-loader/module-proxy';
-
-                const proxy = createProxy({server_module_path});
-
-                // Accessing the __esModule property and exporting $$typeof are required here.
-                // The __esModule getter forces the proxy target to create the default export
-                // and the $$typeof value is for rendering logic to determine if the module
-                // is a client boundary.
-                const {{ __esModule, $$typeof }} = proxy;
-
-                export default proxy;
-            "#,
-            server_module_path = StringifyJs(server_module_path),
-        )?;
-
         // Adapted from
         // next.js/packages/next/src/build/webpack/loaders/next-flight-loader/index.ts
         if let EcmascriptExports::EsmExports(exports) = &*self.client_module.get_exports().await? {
-            let mut exported_names = exports
-                .await?
-                .exports
-                .keys()
-                .cloned()
-                .collect::<IndexSet<_>>();
+            let exports = exports.expand_exports().await?;
 
-            for result in exports.expand_star_exports().await? {
-                let export_info = result.await?;
+            if !exports.dynamic_exports.is_empty() {
+                // TODO: throw? warn?
+            }
 
-                exported_names.extend(export_info.star_exports.iter().cloned());
+            writedoc!(
+                code,
+                r#"
+                    import {{ createProxy }} from 'next/dist/build/webpack/loaders/next-flight-loader/module-proxy';
 
-                if export_info.has_dynamic_exports {
-                    // TODO: throw? warn?
+                    const proxy = createProxy({server_module_path});
+
+                    // Accessing the __esModule property and exporting $$typeof are required here.
+                    // The __esModule getter forces the proxy target to create the default export
+                    // and the $$typeof value is for rendering logic to determine if the module
+                    // is a client boundary.
+                    const {{ __esModule, $$typeof }} = proxy;
+                    const __default__ = proxy.default;
+                "#,
+                server_module_path = StringifyJs(server_module_path),
+            )?;
+
+            let mut cnt: i32 = 0;
+
+            for client_ref in exports.exports.keys() {
+                if client_ref.is_empty() {
+                    // not sure when this would occur, copied it from the next.js version
+                    writedoc!(
+                        code,
+                        r#"
+                            exports[''] = createProxy({server_module_path});
+                        "#,
+                        server_module_path = StringifyJs(&format!("{}#", server_module_path)),
+                    )?;
+                } else if client_ref == "default" {
+                    writedoc!(
+                        code,
+                        r#"
+                            export {{ __esModule, $$typeof }};
+                            export default __default__;
+                        "#,
+                    )?;
+                } else {
+                    writedoc!(
+                        code,
+                        r#"
+                            const e{cnt} = createProxy({server_module_path});
+                            export {{ e{cnt} as {client_ref} }};
+                        "#,
+                        server_module_path =
+                            StringifyJs(&format!("{}#{}", server_module_path, client_ref)),
+                        cnt = cnt,
+                        client_ref = client_ref,
+                    )?;
+                    cnt += 1;
                 }
             }
+        } else {
+            writedoc!(
+                code,
+                r#"
+                    const {{ createProxy }} = require('next/dist/build/webpack/loaders/next-flight-loader/module-proxy');
 
-            for (i, client_ref) in exported_names.into_iter().enumerate() {
-                writedoc!(
-                    code,
-                    r#"
-                        // Initialize export.
-                        const _e{cnt} = proxy[{client_ref}];
-                    "#,
-                    client_ref = StringifyJs(&client_ref),
-                    cnt = i,
-                )?;
-            }
+                    const proxy = createProxy({server_module_path});
+
+                    __turbopack_export_namespace__(proxy);
+                "#,
+                server_module_path = StringifyJs(server_module_path)
+            )?;
         };
 
         let code = code.build();
